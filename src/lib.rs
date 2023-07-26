@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signed<T: Clone + Serialize> {
     pub key: String,
+    pub server: String,
     pub timestamp: u64,
     #[serde(flatten)]
     pub data: T,
@@ -18,13 +19,14 @@ pub struct Signed<T: Clone + Serialize> {
 }
 
 impl<T: Clone + Serialize> Signed<T> {
-    pub fn new(key_pair: &KeyPair, timestamp: u64, data: T) -> Option<Self> {
+    pub fn new(key_pair: &KeyPair, server: String, timestamp: u64, data: T) -> Option<Self> {
         let Some(public_key) = key_pair.public_key() else {
             return None;
         };
 
         let mut signed = Signed {
             key: public_key.to_base64(),
+            server,
             timestamp,
             data,
             signature: String::new(),

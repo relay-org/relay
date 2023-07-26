@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -7,16 +10,15 @@ use crossterm::{
 };
 use lay::{
     crypto::KeyPair,
+    profile::{Profile, ProfileRequest},
     text::{Post, PostRequest},
     Signed,
 };
 use ratatui::{
     prelude::{Backend, Constraint, CrosstermBackend, Layout},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{
-        Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    },
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
 };
 use reqwest::Client;
@@ -28,13 +30,22 @@ struct Message {
     content: String,
 }
 
+#[derive(Clone)]
+struct ProfileDisplay {
+    key: String,
+    name: String,
+    verified: bool,
+}
+
 enum FrontendCommand {
     DisplayMessages { messages: Vec<Message> },
+    RespondProfile { profile: ProfileDisplay },
 }
 
 enum Mode {
     Normal,
     Input,
+    Command,
 }
 
 struct State {
@@ -48,6 +59,8 @@ struct State {
     vertical_scroll: usize,
     horizontal_scroll: usize,
     command_buffer: String,
+    users: HashMap<String, ProfileDisplay>,
+    unknown_users: Vec<String>,
 }
 
 impl Default for State {
@@ -63,6 +76,8 @@ impl Default for State {
             vertical_scroll: 0,
             horizontal_scroll: 0,
             command_buffer: String::new(),
+            users: HashMap::new(),
+            unknown_users: Vec::new(),
         }
     }
 }
@@ -131,6 +146,13 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
             ],
             Style::default(),
         ),
+        Mode::Command => (
+            vec![
+                "COMMAND".bg(Color::Magenta).fg(Color::White),
+                server.as_str().into(),
+            ],
+            Style::default(),
+        ),
     };
 
     let mut text = Text::from(Line::from(msg));
@@ -140,7 +162,9 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
     frame.render_widget(mode_message, chunks[0]);
 
     let (msg, style) = match state.mode {
-        Mode::Normal => (vec![state.command_buffer.as_str().into()], Style::default()),
+        Mode::Normal | Mode::Command => {
+            (vec![state.command_buffer.as_str().into()], Style::default())
+        }
         Mode::Input => (vec![], Style::default()),
     };
 
@@ -154,6 +178,7 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
         .style(match state.mode {
             Mode::Normal => Style::default(),
             Mode::Input => Style::default().fg(Color::Gray),
+            Mode::Command => Style::default(),
         })
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(input, chunks[2]);
@@ -164,12 +189,23 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
             chunks[2].x + state.cursor_position as u16 + 1,
             chunks[2].y + 1,
         ),
+        Mode::Command => {}
     }
 
     let messages: Vec<Line> = state
         .messages
         .iter()
-        .map(|m| Line::from(Span::raw(format!("{}: {}", m.sender, m.content))))
+        .map(|m| {
+            let sender = if state.users.contains_key(&m.sender) {
+                state.users[&m.sender].name.as_str()
+            } else {
+                state.unknown_users.push(m.sender.clone());
+
+                "Guest"
+            };
+
+            Line::from(Span::raw(format!("{}: {}", sender, m.content)))
+        })
         .collect();
 
     state.vertical_scroll_state = state
@@ -210,30 +246,51 @@ async fn frontend<B: Backend>(
     let mut state = State::default();
 
     'l: loop {
+        let mut redraw = false;
+
         // process commands
         while let Ok(cmd) = chan.1.try_recv() {
+            redraw = true;
+
             match cmd {
                 FrontendCommand::DisplayMessages { messages } => {
                     // TODO: This should append new messages.
                     state.messages = messages;
                 }
+                FrontendCommand::RespondProfile { profile } => {
+                    state.users.insert(profile.key.clone(), profile);
+                }
             }
+        }
+
+        // update profile requests
+        for target in state.unknown_users.drain(..) {
+            chan.0
+                .send(BackendCommand::RequestProfile { target })
+                .await
+                .unwrap();
         }
 
         // check for input
         if event::poll(Duration::from_millis(1)).unwrap() {
             if let Event::Key(key) = event::read().unwrap() {
+                redraw = true;
+
                 match state.mode {
                     Mode::Normal => match key.code {
                         KeyCode::Char('i') => {
                             state.mode = Mode::Input;
                             state.command_buffer.clear();
                         }
+                        KeyCode::Char(':') => {
+                            state.mode = Mode::Command;
+                            state.command_buffer = ":".to_string();
+                        }
                         KeyCode::Char('q') => {
                             chan.0.send(BackendCommand::Exit).await.unwrap();
                             break 'l;
                         }
-                        KeyCode::Char('h') => {
+                        KeyCode::Char('h') | KeyCode::Left => {
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
@@ -245,7 +302,7 @@ async fn frontend<B: Backend>(
                                 .horizontal_scroll_state
                                 .position(state.horizontal_scroll as u16);
                         }
-                        KeyCode::Char('j') => {
+                        KeyCode::Char('j') | KeyCode::Down => {
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
@@ -256,7 +313,7 @@ async fn frontend<B: Backend>(
                                 .vertical_scroll_state
                                 .position(state.vertical_scroll as u16);
                         }
-                        KeyCode::Char('k') => {
+                        KeyCode::Char('k') | KeyCode::Up => {
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
@@ -267,7 +324,7 @@ async fn frontend<B: Backend>(
                                 .vertical_scroll_state
                                 .position(state.vertical_scroll as u16);
                         }
-                        KeyCode::Char('l') => {
+                        KeyCode::Char('l') | KeyCode::Right => {
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
@@ -303,19 +360,50 @@ async fn frontend<B: Backend>(
                         KeyCode::Esc => state.mode = Mode::Normal,
                         _ => {}
                     },
+                    Mode::Command => match key.code {
+                        KeyCode::Enter => {
+                            // TODO: Proper command API.
+                            let args: Vec<&str> = state.command_buffer.split_whitespace().collect();
+
+                            match args[0] {
+                                ":profile" if args.len() == 2 => {
+                                    chan.0
+                                        .send(BackendCommand::SendProfile {
+                                            name: args[1].to_string(),
+                                        })
+                                        .await
+                                        .unwrap();
+                                }
+                                ":refresh-profiles" if args.len() == 1 => state.users.clear(),
+                                _ => {}
+                            }
+
+                            state.command_buffer.clear();
+                            state.mode = Mode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            state.command_buffer.pop();
+                        }
+                        KeyCode::Char(c) => state.command_buffer.push(c),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
         }
 
         // draw ui
-        terminal.draw(|f| draw_ui(&mut state, f, &server)).unwrap();
+        if redraw {
+            terminal.draw(|f| draw_ui(&mut state, f, &server)).unwrap();
+        }
     }
 }
 
 enum BackendCommand {
     Exit,
     SendMessage { content: String },
+    SendProfile { name: String },
+    RequestProfile { target: String },
 }
 
 async fn backend(
@@ -325,6 +413,7 @@ async fn backend(
 ) {
     let client = Client::new();
     let text_url = format!("{server}/text");
+    let profile_url = format!("{server}/profile");
 
     'l: loop {
         // process commands
@@ -334,6 +423,7 @@ async fn backend(
                 BackendCommand::SendMessage { content } => {
                     let post = Signed::new(
                         &key_pair,
+                        server.clone(),
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -354,12 +444,88 @@ async fn backend(
                         .await
                         .unwrap();
                 }
+                BackendCommand::SendProfile { name } => {
+                    let profile = Signed::new(
+                        &key_pair,
+                        server.clone(),
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                        Profile {
+                            name,
+                            metadata: None,
+                        },
+                    )
+                    .unwrap();
+
+                    client
+                        .post(&profile_url)
+                        .header("Content-Type", "application/json")
+                        .body(serde_json::to_string(&profile).unwrap())
+                        .send()
+                        .await
+                        .unwrap();
+                }
+                BackendCommand::RequestProfile { target } => {
+                    let req = Signed::new(
+                        &key_pair,
+                        server.clone(),
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                        ProfileRequest {
+                            target_key: target.clone(),
+                        },
+                    )
+                    .unwrap();
+
+                    let res = client
+                        .get(&profile_url)
+                        .header("Content-Type", "application/json")
+                        .body(serde_json::to_string(&req).unwrap())
+                        .send()
+                        .await
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap();
+
+                    if let Ok(profile) = serde_json::from_str::<Signed<Profile>>(&res) {
+                        let verified = profile.verify();
+
+                        chan.0
+                            .send(FrontendCommand::RespondProfile {
+                                profile: ProfileDisplay {
+                                    key: profile.key,
+                                    name: profile.data.name,
+                                    verified,
+                                },
+                            })
+                            .await
+                            .unwrap();
+                    } else {
+                        // TODO: This is stupid.
+                        chan.0
+                            .send(FrontendCommand::RespondProfile {
+                                profile: ProfileDisplay {
+                                    key: target.clone(),
+                                    name: "Guest".to_string(),
+                                    verified: false,
+                                },
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
             }
         }
 
         // poll messages
         let req = Signed::new(
             &key_pair,
+            server.clone(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

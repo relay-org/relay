@@ -1,78 +1,22 @@
+mod profile;
+mod text;
+
 use std::net::SocketAddr;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
-use lay::{
-    text::{Post, PostRequest},
-    Error, Signed,
-};
+use axum::{routing::get, Router};
+use profile::{get_profile, post_profile};
 use rbatis::RBatis;
-use rbs::to_value;
-use serde_json::json;
-
-async fn get_text(
-    State(db): State<RBatis>,
-    Json(req): Json<Signed<PostRequest>>,
-) -> impl IntoResponse {
-    if !req.verify() {
-        let error = serde_json::to_value(Error {
-            status: "FAILED_VERIFY_SIGNATURE".to_string(),
-            message: "Signature verification failed!".to_string(),
-            details: None,
-        })
-        .unwrap();
-
-        return (StatusCode::BAD_REQUEST, Json(error));
-    }
-
-    let messages: Vec<Signed<Post>> = db
-        .query_decode("select * from posts;", vec![])
-        .await
-        .unwrap();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(messages).unwrap()),
-    )
-}
-
-async fn post_text(State(db): State<RBatis>, Json(req): Json<Signed<Post>>) -> impl IntoResponse {
-    if !req.verify() {
-        let error = serde_json::to_value(Error {
-            status: "FAILED_VERIFY_SIGNATURE".to_string(),
-            message: "Signature verification failed!".to_string(),
-            details: None,
-        })
-        .unwrap();
-
-        return (StatusCode::BAD_REQUEST, Json(error));
-    }
-
-    println!("{req:?}");
-
-    db.exec(
-        "insert into posts (key, timestamp, channel, content, signature) values (?1, ?2, ?3, ?4, ?5);",
-        vec![
-            to_value!(req.key),
-            to_value!(req.timestamp),
-            to_value!(req.data.channel),
-            to_value!(req.data.content),
-            to_value!(req.signature),
-        ],
-    )
-    .await
-    .unwrap();
-
-    (StatusCode::OK, Json(json!({})))
-}
+use text::{get_text, post_text};
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let _domain = std::env::var_os("RELAY_DOMAIN")
-        .expect("Relay domain must be set via environment variable 'RELAY_DOMAIN'")
-        .into_string()
-        .unwrap();
+    // NOTE: This is used for HTTPS later, disabled for now.
+    /*let _domain = std::env::var_os("RELAY_DOMAIN")
+    .expect("Relay domain must be set via environment variable 'RELAY_DOMAIN'")
+    .into_string()
+    .unwrap();*/
     let db_url = std::env::var_os("DATABASE_URL")
         .expect("Relay db url must be set via environment variable 'RELAY_DB'")
         .into_string()
@@ -83,8 +27,14 @@ async fn main() {
         .unwrap();
     db.get_pool().unwrap().resize(5);
 
+    // setup db
+    db.exec("create table if not exists posts (key varchar(48) not null, server varchar(48) not null, timestamp bigint not null, channel text not null, content text, signature varchar(96) primary key);", vec![]).await.unwrap();
+    db.exec("create table if not exists users (key varchar(48) primary key, lastrequest bigint not null)", vec![]).await.unwrap();
+    db.exec("create table if not exists profiles (key varchar(48) primary key, server varchar(48) not null, timestamp bigint not null, name varchar(255) not null, signature varchar(96) not null)", vec![]).await.unwrap();
+
     let app = Router::new()
         .route("/text", get(get_text).post(post_text))
+        .route("/profile", get(get_profile).post(post_profile))
         .with_state(db);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
