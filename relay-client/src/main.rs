@@ -199,7 +199,9 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
             let sender = if state.users.contains_key(&m.sender) {
                 state.users[&m.sender].name.as_str()
             } else {
-                state.unknown_users.push(m.sender.clone());
+                if !state.unknown_users.contains(&m.sender) {
+                    state.unknown_users.push(m.sender.clone());
+                }
 
                 "Guest"
             };
