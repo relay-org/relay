@@ -14,7 +14,9 @@ use ratatui::{
     prelude::{Backend, Constraint, CrosstermBackend, Layout},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{
+        Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    },
     Frame, Terminal,
 };
 use reqwest::Client;
@@ -40,6 +42,11 @@ struct State {
     input: String,
     messages: Vec<Message>,
     cursor_position: usize,
+    vertical_scroll_state: ScrollbarState,
+    horizontal_scroll_state: ScrollbarState,
+    vertical_scroll: usize,
+    horizontal_scroll: usize,
+    command_buffer: String,
 }
 
 impl Default for State {
@@ -49,6 +56,11 @@ impl Default for State {
             input: String::new(),
             messages: Vec::new(),
             cursor_position: 0,
+            vertical_scroll_state: ScrollbarState::default(),
+            horizontal_scroll_state: ScrollbarState::default(),
+            vertical_scroll: 0,
+            horizontal_scroll: 0,
+            command_buffer: String::new(),
         }
     }
 }
@@ -85,37 +97,34 @@ impl State {
     }
 }
 
-fn draw_ui<B: Backend>(state: &State, frame: &mut Frame<B>) {
+fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>) {
     let chunks = Layout::default()
         .direction(ratatui::prelude::Direction::Vertical)
         .constraints(
             [
-                Constraint::Min(1),
                 Constraint::Length(1),
+                Constraint::Min(1),
                 Constraint::Length(3),
+                Constraint::Length(1),
             ]
             .as_ref(),
         )
         .split(frame.size());
 
+    let input_count = format!("  {}", state.input.len());
+
     let (msg, style) = match state.mode {
         Mode::Normal => (
             vec![
-                "Press ".into(),
-                "q".bold(),
-                " to exit, ".into(),
-                "i".bold(),
-                " to input.".bold(),
+                "NORMAL".bg(Color::DarkGray).fg(Color::White),
+                " http://0.0.0.0:3000".into(),
             ],
-            Style::default().add_modifier(Modifier::RAPID_BLINK),
+            Style::default(),
         ),
         Mode::Input => (
             vec![
-                "Press ".into(),
-                "Esc".bold(),
-                " to stop input, ".into(),
-                "Enter".bold(),
-                " to send the input.".into(),
+                "INPUT".bg(Color::LightBlue).fg(Color::Black),
+                input_count.as_str().into(),
             ],
             Style::default(),
         ),
@@ -124,15 +133,26 @@ fn draw_ui<B: Backend>(state: &State, frame: &mut Frame<B>) {
     let mut text = Text::from(Line::from(msg));
     text.patch_style(style);
 
+    let mode_message = Paragraph::new(text);
+    frame.render_widget(mode_message, chunks[0]);
+
+    let (msg, style) = match state.mode {
+        Mode::Normal => (vec![state.command_buffer.as_str().into()], Style::default()),
+        Mode::Input => (vec![], Style::default()),
+    };
+
+    let mut text = Text::from(Line::from(msg));
+    text.patch_style(style);
+
     let help_message = Paragraph::new(text);
-    frame.render_widget(help_message, chunks[1]);
+    frame.render_widget(help_message, chunks[3]);
 
     let input = Paragraph::new(state.input.as_str())
         .style(match state.mode {
             Mode::Normal => Style::default(),
-            Mode::Input => Style::default().fg(Color::LightBlue),
+            Mode::Input => Style::default().fg(Color::Gray),
         })
-        .block(Block::default().borders(Borders::ALL).title("input"));
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(input, chunks[2]);
 
     match state.mode {
@@ -143,18 +163,32 @@ fn draw_ui<B: Backend>(state: &State, frame: &mut Frame<B>) {
         ),
     }
 
-    let messages: Vec<ListItem> = state
+    let messages: Vec<Line> = state
         .messages
         .iter()
-        .map(|m| {
-            let content = Line::from(Span::raw(format!("{}: {}", m.sender, m.content)));
-            ListItem::new(content)
-        })
+        .map(|m| Line::from(Span::raw(format!("{}: {}", m.sender, m.content))))
         .collect();
 
-    let messages =
-        List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
-    frame.render_widget(messages, chunks[0]);
+    state.vertical_scroll_state = state
+        .vertical_scroll_state
+        .content_length(messages.len() as u16);
+    state.horizontal_scroll_state = state.horizontal_scroll_state.content_length(50);
+
+    let messages = Paragraph::new(messages)
+        .block(Block::default().borders(Borders::ALL).title("Messages"))
+        .scroll((state.vertical_scroll as u16, state.horizontal_scroll as u16));
+
+    frame.render_widget(messages, chunks[1]);
+    frame.render_stateful_widget(
+        Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+        chunks[1],
+        &mut state.vertical_scroll_state,
+    );
+    frame.render_stateful_widget(
+        Scrollbar::default().orientation(ScrollbarOrientation::HorizontalBottom),
+        chunks[1],
+        &mut state.horizontal_scroll_state,
+    );
 }
 
 async fn frontend<B: Backend>(
@@ -179,15 +213,57 @@ async fn frontend<B: Backend>(
             if let Event::Key(key) = event::read().unwrap() {
                 match state.mode {
                     Mode::Normal => match key.code {
-                        KeyCode::Char('i') => state.mode = Mode::Input,
+                        KeyCode::Char('i') => {
+                            state.mode = Mode::Input;
+                            state.command_buffer.clear();
+                        }
                         KeyCode::Char('q') => {
                             chan.0.send(BackendCommand::Exit).await.unwrap();
                             break 'l;
                         }
+                        KeyCode::Char('h') => {
+                            let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
+                            state.command_buffer.clear();
+
+                            state.horizontal_scroll =
+                                state.horizontal_scroll.saturating_sub(offset);
+                            state.horizontal_scroll_state = state
+                                .horizontal_scroll_state
+                                .position(state.horizontal_scroll as u16);
+                        }
+                        KeyCode::Char('j') => {
+                            let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
+                            state.command_buffer.clear();
+
+                            state.vertical_scroll = state.vertical_scroll.saturating_add(offset);
+                            state.vertical_scroll_state = state
+                                .vertical_scroll_state
+                                .position(state.vertical_scroll as u16);
+                        }
+                        KeyCode::Char('k') => {
+                            let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
+                            state.command_buffer.clear();
+
+                            state.vertical_scroll = state.vertical_scroll.saturating_sub(offset);
+                            state.vertical_scroll_state = state
+                                .vertical_scroll_state
+                                .position(state.vertical_scroll as u16);
+                        }
+                        KeyCode::Char('l') => {
+                            let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
+                            state.command_buffer.clear();
+
+                            state.horizontal_scroll =
+                                state.horizontal_scroll.saturating_add(offset);
+                            state.horizontal_scroll_state = state
+                                .horizontal_scroll_state
+                                .position(state.horizontal_scroll as u16);
+                        }
+                        KeyCode::Char(c) if c.is_digit(10) => state.command_buffer.push(c),
                         _ => {}
                     },
                     Mode::Input if key.kind == KeyEventKind::Press => match key.code {
-                        KeyCode::Enter => {
+                        KeyCode::Enter if state.input.len() > 0 => {
                             chan.0
                                 .send(BackendCommand::SendMessage {
                                     content: state.input.clone(),
@@ -212,7 +288,7 @@ async fn frontend<B: Backend>(
         }
 
         // draw ui
-        terminal.draw(|f| draw_ui(&state, f)).unwrap();
+        terminal.draw(|f| draw_ui(&mut state, f)).unwrap();
     }
 }
 
@@ -282,7 +358,8 @@ async fn backend(mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>), 
 
         let messages: Vec<Signed<Post>> = serde_json::from_str(&resp).unwrap();
 
-        chan.0
+        if chan
+            .0
             .send(FrontendCommand::DisplayMessages {
                 messages: messages
                     .iter()
@@ -293,7 +370,10 @@ async fn backend(mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>), 
                     .collect(),
             })
             .await
-            .unwrap();
+            .is_err()
+        {
+            break;
+        }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
