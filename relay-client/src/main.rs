@@ -42,6 +42,7 @@ struct State {
     input: String,
     messages: Vec<Message>,
     cursor_position: usize,
+    autoscroll: bool,
     vertical_scroll_state: ScrollbarState,
     horizontal_scroll_state: ScrollbarState,
     vertical_scroll: usize,
@@ -56,6 +57,7 @@ impl Default for State {
             input: String::new(),
             messages: Vec::new(),
             cursor_position: 0,
+            autoscroll: true,
             vertical_scroll_state: ScrollbarState::default(),
             horizontal_scroll_state: ScrollbarState::default(),
             vertical_scroll: 0,
@@ -179,6 +181,14 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
         .block(Block::default().borders(Borders::ALL).title("Messages"))
         .scroll((state.vertical_scroll as u16, state.horizontal_scroll as u16));
 
+    // handle autoscroll
+    if state.autoscroll && state.messages.len() > chunks[1].height as usize {
+        state.vertical_scroll = state.messages.len() - chunks[1].height as usize + 2;
+        state.vertical_scroll_state = state
+            .vertical_scroll_state
+            .position(state.vertical_scroll as u16);
+    }
+
     frame.render_widget(messages, chunks[1]);
     frame.render_stateful_widget(
         Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
@@ -227,6 +237,8 @@ async fn frontend<B: Backend>(
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
+                            state.autoscroll = false;
+
                             state.horizontal_scroll =
                                 state.horizontal_scroll.saturating_sub(offset);
                             state.horizontal_scroll_state = state
@@ -237,6 +249,8 @@ async fn frontend<B: Backend>(
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
+                            state.autoscroll = false;
+
                             state.vertical_scroll = state.vertical_scroll.saturating_add(offset);
                             state.vertical_scroll_state = state
                                 .vertical_scroll_state
@@ -245,6 +259,8 @@ async fn frontend<B: Backend>(
                         KeyCode::Char('k') => {
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
+
+                            state.autoscroll = false;
 
                             state.vertical_scroll = state.vertical_scroll.saturating_sub(offset);
                             state.vertical_scroll_state = state
@@ -255,12 +271,15 @@ async fn frontend<B: Backend>(
                             let offset = state.command_buffer.parse::<usize>().unwrap_or(1);
                             state.command_buffer.clear();
 
+                            state.autoscroll = false;
+
                             state.horizontal_scroll =
                                 state.horizontal_scroll.saturating_add(offset);
                             state.horizontal_scroll_state = state
                                 .horizontal_scroll_state
                                 .position(state.horizontal_scroll as u16);
                         }
+                        KeyCode::Char('s') => state.autoscroll = true,
                         KeyCode::Char(c) if c.is_digit(10) => state.command_buffer.push(c),
                         _ => {}
                     },
