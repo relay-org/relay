@@ -97,7 +97,7 @@ impl State {
     }
 }
 
-fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>) {
+fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>, server: &str) {
     let chunks = Layout::default()
         .direction(ratatui::prelude::Direction::Vertical)
         .constraints(
@@ -112,12 +112,13 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>) {
         .split(frame.size());
 
     let input_count = format!("  {}", state.input.len());
+    let server = format!(" {server}");
 
     let (msg, style) = match state.mode {
         Mode::Normal => (
             vec![
                 "NORMAL".bg(Color::DarkGray).fg(Color::White),
-                " http://0.0.0.0:3000".into(),
+                server.as_str().into(),
             ],
             Style::default(),
         ),
@@ -194,6 +195,7 @@ fn draw_ui<B: Backend>(state: &mut State, frame: &mut Frame<B>) {
 async fn frontend<B: Backend>(
     mut chan: (Sender<BackendCommand>, Receiver<FrontendCommand>),
     terminal: &mut Terminal<B>,
+    server: String,
 ) {
     let mut state = State::default();
 
@@ -288,7 +290,7 @@ async fn frontend<B: Backend>(
         }
 
         // draw ui
-        terminal.draw(|f| draw_ui(&mut state, f)).unwrap();
+        terminal.draw(|f| draw_ui(&mut state, f, &server)).unwrap();
     }
 }
 
@@ -297,8 +299,13 @@ enum BackendCommand {
     SendMessage { content: String },
 }
 
-async fn backend(mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>), key_pair: KeyPair) {
+async fn backend(
+    mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>),
+    key_pair: KeyPair,
+    server: String,
+) {
     let client = Client::new();
+    let text_url = format!("{server}/text");
 
     'l: loop {
         // process commands
@@ -321,7 +328,7 @@ async fn backend(mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>), 
                     .unwrap();
 
                     client
-                        .post("http://0.0.0.0:3000/text")
+                        .post(&text_url)
                         .header("Content-Type", "application/json")
                         .body(serde_json::to_string(&post).unwrap())
                         .send()
@@ -346,7 +353,7 @@ async fn backend(mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>), 
         .unwrap();
 
         let resp = client
-            .get("http://0.0.0.0:3000/text")
+            .get(&text_url)
             .header("Content-Type", "application/json")
             .body(serde_json::to_string(&req).unwrap())
             .send()
@@ -382,6 +389,8 @@ async fn backend(mut chan: (Sender<FrontendCommand>, Receiver<BackendCommand>), 
 #[tokio::main]
 async fn main() {
     // load config
+    let server = std::env::var("IP").unwrap_or("http://0.0.0.0:3000".to_string());
+
     let pkcs8 = KeyPair::generate_pkcs8().unwrap();
     let key_pair = KeyPair::from_pkcs8(&pkcs8).unwrap();
 
@@ -398,9 +407,11 @@ async fn main() {
     let (fs, fr) = mpsc::channel(32);
     let (bs, br) = mpsc::channel(32);
 
-    let handle = tokio::spawn(async move { backend((fs, br), key_pair).await });
+    let backend_server = server.clone();
 
-    frontend((bs, fr), &mut terminal).await;
+    let handle = tokio::spawn(async move { backend((fs, br), key_pair, backend_server).await });
+
+    frontend((bs, fr), &mut terminal, server).await;
 
     handle.await.unwrap();
 
